@@ -1,0 +1,2143 @@
+<script>
+      let state = {
+        id: "",
+        token: "",
+        name: "",
+        subjects: [],
+        activeSubj: "",
+        isFaculty: false,
+        editTarget: null,
+        pendingEdits: [],
+        dailyProgress: [],
+        schedule: [],
+        viewedStudentId: "",
+        alternatives: {},
+      };
+      let cropper = null;
+      let attChartInstance = null;
+      let dailyChartInstance = null;
+      let scheduleInterval = null;
+      let lastWarningDismissed = 0;
+      let autoRefreshInterval = null;
+
+      function updateClock() {
+        const now = new Date();
+        S("c-time").innerText = now.toLocaleTimeString("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+        S("c-date").innerText = now.toLocaleDateString("en-US", {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        });
+      }
+      updateClock();
+      setInterval(updateClock, 1000);
+
+      // ─── ULTRA REAL-TIME AUTO REFRESH ───
+      function startAutoRefresh() {
+        if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+        autoRefreshInterval = setInterval(() => {
+          if (state.isFaculty) {
+            if (!state.activeSubj) return;
+            if (state.viewedStudentId) {
+              google.script.run
+                .withSuccessHandler((res) => {
+                  if (res.success) populateDashboardUI(res, true);
+                })
+                .fetchSubjectData(
+                  state.viewedStudentId,
+                  state.activeSubj,
+                  true,
+                  state.token
+                );
+            } else {
+              google.script.run
+                .withSuccessHandler((res) => {
+                  if (res.success) renderDataViews(res.sheetData, true);
+                })
+                .fetchSubjectRoster(state.activeSubj, state.token);
+            }
+          } else {
+            if (state.activeSubj && state.id) {
+              google.script.run
+                .withSuccessHandler((res) => {
+                  if (res.success) populateDashboardUI(res, true);
+                })
+                .fetchSubjectData(state.id, state.activeSubj, false, state.token);
+            }
+          }
+        }, 180000); // 180 seconds polling
+      }
+
+      function stopAutoRefresh() {
+        if (autoRefreshInterval) {
+          clearInterval(autoRefreshInterval);
+          autoRefreshInterval = null;
+        }
+      }
+
+      // ─── FLOATING TIMER LOGIC ───
+      const floatTimer = S("floating-timer");
+      const timerHeader = S("timer-header");
+      let isDragging = false,
+        currentX,
+        currentY,
+        initialX,
+        initialY,
+        xOffset = 0,
+        yOffset = 0;
+
+      timerHeader.addEventListener("mousedown", dragStart);
+      timerHeader.addEventListener("touchstart", dragStart, { passive: false });
+      document.addEventListener("mouseup", dragEnd);
+      document.addEventListener("touchend", dragEnd);
+      document.addEventListener("mousemove", drag);
+      document.addEventListener("touchmove", drag, { passive: false });
+
+      function dragStart(e) {
+        if (e.target.closest(".min-btn")) return;
+        initialX =
+          (e.type === "touchstart" ? e.touches[0].clientX : e.clientX) -
+          xOffset;
+        initialY =
+          (e.type === "touchstart" ? e.touches[0].clientY : e.clientY) -
+          yOffset;
+        if (e.target === timerHeader || timerHeader.contains(e.target))
+          isDragging = true;
+      }
+      function dragEnd() {
+        isDragging = false;
+      }
+      function drag(e) {
+        if (!isDragging) return;
+        e.preventDefault();
+        currentX =
+          (e.type === "touchmove" ? e.touches[0].clientX : e.clientX) -
+          initialX;
+        currentY =
+          (e.type === "touchmove" ? e.touches[0].clientY : e.clientY) -
+          initialY;
+        xOffset = currentX;
+        yOffset = currentY;
+        floatTimer.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+      }
+
+      function toggleTimerMinMax(e) {
+        if (e) e.stopPropagation();
+        floatTimer.classList.toggle("minimized");
+      }
+      floatTimer.addEventListener("click", (e) => {
+        if (floatTimer.classList.contains("minimized"))
+          floatTimer.classList.remove("minimized");
+      });
+
+      function dismissWarning() {
+        S("in-class-modal").classList.remove("active");
+        lastWarningDismissed = Date.now();
+      }
+
+      function parseTimeToDate(timeStr) {
+        if (!timeStr) return null;
+        let d = new Date();
+        let t = timeStr.toLowerCase();
+        let isPM = t.includes("pm");
+        let isAM = t.includes("am");
+
+        let cleanStr = t.replace(/am|pm/g, '').trim();
+        let parts = cleanStr.split(":");
+        if (parts.length < 2) return null;
+
+        let h = parseInt(parts[0], 10);
+        let m = parseInt(parts[1], 10);
+
+        if (isNaN(h) || isNaN(m)) return null;
+
+        if (isPM && h < 12) h += 12;
+        if (isAM && h === 12) h = 0;
+
+        d.setHours(h, m, 0, 0);
+        return d;
+      }
+
+      function runScheduleLoop() {
+        if (state.isFaculty || !state.schedule || state.schedule.length === 0) {
+          hide("floating-timer");
+          if (scheduleInterval) clearInterval(scheduleInterval);
+          return;
+        }
+
+        if (!scheduleInterval) {
+          scheduleInterval = setInterval(runScheduleLoop, 1000);
+          show("floating-timer");
+        }
+
+        const now = new Date();
+        const days = [
+          "Sunday",
+          "Monday",
+          "Tuesday",
+          "Wednesday",
+          "Thursday",
+          "Friday",
+          "Saturday",
+        ];
+        const todayStr = days[now.getDay()];
+
+        let inClass = false;
+        let nextClass = null;
+        let minDiff = Infinity;
+
+        for (let i = 0; i < state.schedule.length; i++) {
+          let s = state.schedule[i];
+          if (s.day === todayStr) {
+            let tIn = parseTimeToDate(s.timeIn);
+            let tOut = parseTimeToDate(s.timeOut);
+            if (!tIn || !tOut) continue;
+
+            if (now >= tIn && now <= tOut) {
+              inClass = true;
+              break;
+            }
+
+            if (tIn > now) {
+              let diff = tIn - now;
+              if (diff < minDiff) {
+                minDiff = diff;
+                nextClass = { subj: s.subjectCode, timeIn: tIn };
+              }
+            }
+          }
+        }
+
+        if (inClass) {
+          hide("floating-timer");
+          if (Date.now() - lastWarningDismissed > 10000) {
+            S("in-class-modal").classList.add("active");
+          }
+        } else {
+          S("in-class-modal").classList.remove("active");
+          show("floating-timer");
+          if (nextClass) {
+            S("t-subj").innerText = nextClass.subj;
+            let diff = nextClass.timeIn - now;
+            let h = Math.floor(
+              (diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60),
+            );
+            let m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+            let s = Math.floor((diff % (1000 * 60)) / 1000);
+            S("t-clock").innerText =
+              `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+          } else {
+            S("t-subj").innerText = "No more classes today";
+            S("t-clock").innerText = "--:--:--";
+          }
+        }
+      }
+
+      function S(id) {
+        return document.getElementById(id);
+      }
+      function show(id) {
+        S(id).classList.remove("hidden");
+      }
+      function hide(id) {
+        S(id).classList.add("hidden");
+      }
+      function showLoader(msg) {
+        S("gl-text").innerText = msg || "Processing...";
+        S("global-loader").classList.add("active");
+      }
+      function hideLoader() {
+        S("global-loader").classList.remove("active");
+      }
+      function setBtn(id, loading, label) {
+        const btn = S(id);
+        if (!btn) return;
+        btn.disabled = loading;
+        if (label) btn.innerText = loading ? "Please wait…" : label;
+      }
+
+      window.onload = function () {
+        showLoader("Connecting...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.status === "MAINTENANCE" || res.status === "CLOSED") {
+              hide("search-screen");
+              show("maintenance-screen");
+              return;
+            }
+            if (res.announcements.length > 0) {
+              let msg = res.announcements
+                .map((a) => `[${a.date}] ${a.message}`)
+                .join("   |   ");
+              S("marquee-text").innerHTML =
+                `<span>${msg}</span><span aria-hidden="true">${msg}</span>`;
+              S("top-banner").className =
+                res.announcements[0].degree === "URGENT"
+                  ? "top-banner banner-urgent"
+                  : "top-banner banner-important";
+              show("top-banner");
+            }
+            restoreSession();
+          })
+          .withFailureHandler(() => hideLoader())
+          .getSystemStatus();
+      };
+
+      function saveSession() {
+        sessionStorage.setItem("portalSession", JSON.stringify(state));
+      }
+      function restoreSession() {
+        const saved = sessionStorage.getItem("portalSession");
+        if (saved) {
+          state = JSON.parse(saved);
+          hide("search-screen");
+          if (state.isFaculty) {
+            S("fac-name-display").innerText = "Logged in as: " + state.name;
+            S("subj-student-name").innerText = "Professor " + state.name;
+            renderSubjectList();
+          } else {
+            S("subj-student-name").innerText = state.name;
+            let fName = state.name.includes(",")
+              ? state.name.split(",")[1].trim()
+              : state.name.split(" ")[0];
+            S("dash-greeting").innerText = "Welcome, " + fName;
+            S("btn-back-dash").innerText = "← Back";
+            S("btn-back-dash").onclick = backToProfile;
+            show("floating-logout");
+
+            google.script.run
+              .withSuccessHandler((pic) => {
+                if (pic) {
+                  S("dash-avatar-img").src = pic;
+                  show("dash-avatar-img");
+                } else hide("dash-avatar-img");
+              })
+              .withFailureHandler(() => {
+                hide("dash-avatar-img");
+              })
+              .getStudentAvatar(state.id, state.token);
+
+            const p = state.profile || {};
+            const isComplete =
+              p.fatherName &&
+              p.fatherContact &&
+              p.motherName &&
+              p.motherContact &&
+              p.address &&
+              p.email;
+
+            show("main-container");
+            show("profile-screen");
+            if (isComplete) {
+              proceedToSubjects();
+            } else {
+              populateProfileEdit();
+              show("profile-edit-mode");
+              hide("profile-view-mode");
+              S("btn-cancel-profile").style.display = "none";
+            }
+
+            runScheduleLoop();
+          }
+        }
+      }
+
+      function populateProfileView() {
+        const p = state.profile || {};
+        S("view-father-name").innerText = p.fatherName || "Not Provided";
+        S("view-father-contact").innerText = p.fatherContact || "Not Provided";
+        S("view-mother-name").innerText = p.motherName || "Not Provided";
+        S("view-mother-contact").innerText = p.motherContact || "Not Provided";
+        S("view-address").innerText = p.address || "Not Provided";
+        S("view-email").innerText = p.email || "Not Provided";
+      }
+
+      function populateProfileEdit() {
+        const p = state.profile || {};
+
+        S("edit-father-name").value =
+          p.fatherName === "N/A" ? "" : p.fatherName || "";
+        S("na-father-name").checked = p.fatherName === "N/A";
+        toggleNA("edit-father-name", p.fatherName === "N/A");
+
+        S("edit-father-contact").value =
+          p.fatherContact === "N/A" ? "" : p.fatherContact || "";
+        S("na-father-contact").checked = p.fatherContact === "N/A";
+        toggleNA("edit-father-contact", p.fatherContact === "N/A");
+
+        S("edit-mother-name").value =
+          p.motherName === "N/A" ? "" : p.motherName || "";
+        S("na-mother-name").checked = p.motherName === "N/A";
+        toggleNA("edit-mother-name", p.motherName === "N/A");
+
+        S("edit-mother-contact").value =
+          p.motherContact === "N/A" ? "" : p.motherContact || "";
+        S("na-mother-contact").checked = p.motherContact === "N/A";
+        toggleNA("edit-mother-contact", p.motherContact === "N/A");
+
+        S("edit-address").value = p.address || "";
+        S("edit-email").value = p.email || "";
+      }
+
+      function toggleNA(inputId, isChecked) {
+        const input = S(inputId);
+        input.disabled = isChecked;
+        if (isChecked) {
+          input.value = "";
+          input.style.opacity = "0.5";
+        } else {
+          input.style.opacity = "1";
+        }
+      }
+
+      function downloadStudentQR() {
+        showLoader("Fetching QR Code...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success && res.data) {
+              const link = document.createElement("a");
+              link.href = res.data;
+              link.download = `QR_${state.id}.png`;
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+            } else {
+              alert("Contact your Teacher immediately");
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            alert("Contact your Teacher immediately");
+          })
+          .getStudentQRCode(state.id, state.token);
+      }
+
+      function openProfileModal() {
+        populateProfileView();
+        show("profile-view-mode");
+        hide("profile-edit-mode");
+        S("btn-close-profile-modal").style.display = "inline-block";
+        S("btn-cancel-profile").style.display = "inline-block";
+        show("profile-screen");
+      }
+
+      function closeProfileModal() {
+        hide("profile-screen");
+      }
+
+      function showProfileEditMode() {
+        populateProfileEdit();
+        show("profile-edit-mode");
+        hide("profile-view-mode");
+        S("btn-cancel-profile").style.display = "inline-block";
+      }
+
+      function cancelProfileEdit() {
+        show("profile-view-mode");
+        hide("profile-edit-mode");
+      }
+
+      function confirmProfileSave() {
+        const fName = S("na-father-name").checked
+          ? "N/A"
+          : S("edit-father-name").value.trim();
+        const fContact = S("na-father-contact").checked
+          ? "N/A"
+          : S("edit-father-contact").value.trim();
+        const mName = S("na-mother-name").checked
+          ? "N/A"
+          : S("edit-mother-name").value.trim();
+        const mContact = S("na-mother-contact").checked
+          ? "N/A"
+          : S("edit-mother-contact").value.trim();
+        const address = S("edit-address").value.trim();
+        const email = S("edit-email").value.trim();
+
+        if (!fName || !fContact || !mName || !mContact || !address || !email) {
+          alert("Please fill in all fields or check 'Not Applicable'.");
+          return;
+        }
+
+        state.tempProfileData = {
+          fatherName: fName,
+          fatherContact: fContact,
+          motherName: mName,
+          motherContact: mContact,
+          address: address,
+          email: email,
+        };
+        show("survey-warning-modal");
+      }
+
+      function submitProfileData() {
+        hide("survey-warning-modal");
+        showLoader("Saving Profile...");
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success) {
+              state.profile = state.tempProfileData;
+              saveSession();
+
+              if(S("subject-screen").classList.contains("hidden") && S("dashboard-screen").classList.contains("hidden")) {
+                hide("profile-screen");
+                proceedToSubjects();
+              } else {
+                populateProfileView();
+                show("profile-view-mode");
+                hide("profile-edit-mode");
+              }
+            } else {
+              alert(res.message);
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            alert("Error saving profile. Please try again.");
+          })
+          .saveStudentProfile(state.id, state.tempProfileData, state.token);
+      }
+
+      async function downloadAsPDF(fileId, fileName) {
+        if (!window.jspdf || !window.jspdf.jsPDF) {
+          alert("PDF Library is not loaded yet. Please try again in a moment.");
+          return;
+        }
+
+        showLoader("Preparing PDF...");
+
+        try {
+          const res = await new Promise((resolve, reject) => {
+            google.script.run
+              .withSuccessHandler(resolve)
+              .withFailureHandler(reject)
+              .fetchRawHtmlContent(fileId);
+          });
+
+          if (!res || !res.success) throw new Error(res ? res.message : "Network error");
+          let htmlContent = res.content;
+
+          const iframe = S("render-container");
+          const doc = iframe.contentWindow.document;
+          doc.open();
+          doc.write(htmlContent);
+          doc.close();
+
+          showLoader("Rendering Presentation...");
+
+          await new Promise(async resolve => {
+              const checkReady = async () => {
+                  try {
+                      if (doc.fonts) await doc.fonts.ready;
+                      const images = Array.from(doc.images);
+                      await Promise.all(images.map(img => {
+                          if (img.complete) return Promise.resolve();
+                          return new Promise(r => { img.onload = r; img.onerror = r; });
+                      }));
+                  } catch (e) {}
+                  setTimeout(resolve, 1500);
+              };
+
+              let loaded = false;
+              const fire = () => { if (!loaded) { loaded = true; checkReady(); } };
+              iframe.onload = fire;
+              setTimeout(fire, 5000);
+              if (doc.readyState === 'complete') fire();
+          });
+
+          const body = doc.body;
+          body.style.margin = '0';
+          body.style.padding = '0';
+          body.style.overflow = 'hidden';
+
+          const styleSheet = doc.createElement('style');
+          styleSheet.innerText = `
+              *, *::before, *::after {
+                  transition-duration: 0.01s !important;
+                  transition-delay: 0s !important;
+                  animation-duration: 0.01s !important;
+                  animation-delay: 0s !important;
+              }
+              .slide:not(.active) { display: none !important; opacity: 0 !important; pointer-events: none !important; }
+              .slide.active { display: flex !important; opacity: 1 !important; z-index: 10; }
+              #nav-panel, .nav-btn, #btnNext, #btnPrev, #btnFullscreen, #btnPinNav {
+                  display: none !important;
+                  opacity: 0 !important;
+                  visibility: hidden !important;
+              }
+          `;
+          doc.head.appendChild(styleSheet);
+
+          const { jsPDF } = window.jspdf;
+          const pdf = new jsPDF('l', 'mm', 'a4');
+          const pdfWidth = pdf.internal.pageSize.getWidth();
+          const pdfHeight = pdf.internal.pageSize.getHeight();
+          const VIEWPORT_WIDTH = 1280;
+          const VIEWPORT_HEIGHT = 720;
+
+          const customSlides = doc.querySelectorAll('.slide');
+          const isCustomDeck = customSlides.length > 0;
+          let slideCount = 0;
+          const MAX_SLIDES = isCustomDeck ? customSlides.length : 150;
+
+          while (slideCount < MAX_SLIDES) {
+              showLoader(`Capturing slide ${slideCount + 1} of ${MAX_SLIDES}...`);
+
+              if (isCustomDeck) {
+                  customSlides.forEach(s => s.classList.remove('active'));
+                  customSlides[slideCount].classList.add('active');
+                  await new Promise(r => setTimeout(r, 400));
+              } else {
+                  await new Promise(r => setTimeout(r, 400));
+              }
+
+              const canvas = await html2canvas(body, {
+                  window: iframe.contentWindow,
+                  scale: 1.5,
+                  useCORS: true,
+                  allowTaint: false,
+                  imageTimeout: 15000,
+                  backgroundColor: null,
+                  width: VIEWPORT_WIDTH,
+                  height: VIEWPORT_HEIGHT,
+                  windowWidth: VIEWPORT_WIDTH,
+                  windowHeight: VIEWPORT_HEIGHT,
+                  x: 0, y: 0, scrollX: 0, scrollY: 0
+              });
+
+              const imgData = canvas.toDataURL('image/jpeg', 0.90);
+              const imgProps = pdf.getImageProperties(imgData);
+              const ratio = imgProps.width / imgProps.height;
+
+              let renderWidth = pdfWidth;
+              let renderHeight = pdfWidth / ratio;
+              if (renderHeight > pdfHeight) {
+                  renderHeight = pdfHeight;
+                  renderWidth = pdfHeight * ratio;
+              }
+              const x = (pdfWidth - renderWidth) / 2;
+              const y = (pdfHeight - renderHeight) / 2;
+
+              if (slideCount > 0) pdf.addPage();
+              pdf.addImage(imgData, 'JPEG', x, y, renderWidth, renderHeight);
+
+              slideCount++;
+              if (isCustomDeck) continue;
+
+              const spaceEvent = new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true });
+              const arrowEvent = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true });
+              doc.dispatchEvent(spaceEvent);
+              doc.dispatchEvent(arrowEvent);
+          }
+
+          if (slideCount === 0) throw new Error("File rendered completely empty.");
+
+          showLoader("Finalizing PDF...");
+          await new Promise(r => setTimeout(r, 100));
+          pdf.save(fileName.replace('.html', '') + ".pdf");
+
+        } catch (error) {
+          alert("Error generating PDF: " + error.message);
+        } finally {
+          hideLoader();
+          S("render-container").src = "about:blank";
+        }
+      }
+
+      let currentRoFileId = "";
+      let currentRoFileName = "";
+      let currentRoFileUrl = "";
+
+      function openReviewerOptions(fileId, fileName, fileUrl, typeStr, mimeType) {
+        currentRoFileId = fileId;
+        currentRoFileName = fileName;
+        currentRoFileUrl = fileUrl;
+
+        let isHtml = typeStr === 'HTM' || typeStr === 'HTML' ||
+                     fileName.toLowerCase().endsWith('.html') ||
+                     fileName.toLowerCase().endsWith('.htm') ||
+                     (mimeType && mimeType.toLowerCase().includes('html'));
+
+        if (!isHtml) {
+          window.open(fileUrl, "_blank");
+          return;
+        }
+
+        S("ro-file-name").innerText = fileName;
+        show("reviewer-options-modal");
+      }
+
+      function triggerRoAction(action) {
+        hide("reviewer-options-modal");
+        if (action === 'view') {
+          openStreamer(currentRoFileId, currentRoFileName);
+        } else if (action === 'pdf') {
+          downloadAsPDF(currentRoFileId, currentRoFileName);
+        } else if (action === 'html') {
+          window.open(currentRoFileUrl, "_blank");
+        }
+      }
+
+      function openStreamer(fileId, fileName) {
+        const overlay = S("html-streamer");
+        overlay.classList.add("active");
+
+        // Request fullscreen immediately upon user gesture
+        if (overlay.requestFullscreen) {
+            overlay.requestFullscreen().catch(e => console.log(e));
+        } else if (overlay.webkitRequestFullscreen) {
+            overlay.webkitRequestFullscreen();
+        }
+
+        showLoader("Loading Presentation...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success) {
+              const iframe = S("streamer-iframe");
+              const doc = iframe.contentWindow.document;
+              doc.open();
+              doc.write(res.content);
+              doc.close();
+            } else {
+              closeStreamer();
+              alert("Failed to load presentation: " + res.message);
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            closeStreamer();
+            alert("Error loading presentation.");
+          })
+          .fetchRawHtmlContent(fileId);
+      }
+
+      function closeStreamer() {
+        S("html-streamer").classList.remove("active");
+        S("streamer-iframe").src = "about:blank";
+
+        // Exit native fullscreen if active
+        if (document.fullscreenElement || document.webkitFullscreenElement) {
+            if (document.exitFullscreen) {
+                document.exitFullscreen().catch(e => console.log(e));
+            } else if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            }
+        }
+      }
+
+      function handleForgotSendOTP() {
+        const id = S("forgot-id").value.trim();
+        const msg = S("global-msg");
+        if (!id) {
+          msg.innerText = "⚠️ Please enter your Student ID.";
+          return;
+        }
+        setBtn("btn-forgot-send", true, "Sending...");
+        showLoader("Sending OTP...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-forgot-send", false, "Send OTP");
+            if (res.success) {
+              hide("forgot-step-1");
+              show("forgot-step-2");
+              msg.innerText = "";
+            } else {
+              msg.innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-forgot-send", false, "Send OTP");
+            msg.innerText = "⚠️ Error sending OTP.";
+          })
+          .generateAndSendOTP(id);
+      }
+
+      function handleForgotReset() {
+        const id = S("forgot-id").value.trim();
+        const otp = S("forgot-otp").value.trim();
+        const newPass = S("forgot-new-pass").value;
+        const msg = S("global-msg");
+
+        if (!otp || !newPass) {
+          msg.innerText = "⚠️ Please enter OTP and new password.";
+          return;
+        }
+
+        setBtn("btn-forgot-reset", true, "Resetting...");
+        showLoader("Resetting Password...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-forgot-reset", false, "Reset Password");
+            if (res.success) {
+              switchAuthView("login");
+              msg.style.color = "var(--forest)";
+              msg.innerText = "✅ " + res.message;
+              setTimeout(() => {
+                msg.style.color = "var(--burg)";
+                msg.innerText = "";
+              }, 5000);
+            } else {
+              msg.innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-forgot-reset", false, "Reset Password");
+            msg.innerText = "⚠️ Error resetting password.";
+          })
+          .verifyOTPAndResetPassword(id, otp, newPass);
+      }
+
+      function openChangePasswordModal() {
+        S("cp-msg").innerText = "";
+        S("cp-otp").value = "";
+        S("cp-new-pass").value = "";
+        show("cp-step-1");
+        hide("cp-step-2");
+        show("change-pass-modal");
+      }
+
+      function handleCPSendOTP() {
+        setBtn("btn-cp-send", true, "Sending...");
+        showLoader("Sending OTP...");
+        S("cp-msg").innerText = "";
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-cp-send", false, "Send OTP");
+            if (res.success) {
+              hide("cp-step-1");
+              show("cp-step-2");
+            } else {
+              S("cp-msg").innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-cp-send", false, "Send OTP");
+            S("cp-msg").innerText = "⚠️ Error sending OTP.";
+          })
+          .generateAndSendOTP(state.id);
+      }
+
+      function handleCPSave() {
+        const otp = S("cp-otp").value.trim();
+        const newPass = S("cp-new-pass").value;
+        if (!otp || !newPass) {
+          S("cp-msg").innerText = "⚠️ Please enter OTP and new password.";
+          return;
+        }
+
+        setBtn("btn-cp-save", true, "Saving...");
+        showLoader("Updating Password...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-cp-save", false, "Save Password");
+            if (res.success) {
+              hide("change-pass-modal");
+              alert("Password updated successfully!");
+            } else {
+              S("cp-msg").innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-cp-save", false, "Save Password");
+            S("cp-msg").innerText = "⚠️ Error updating password.";
+          })
+          .verifyOTPAndResetPassword(state.id, otp, newPass);
+      }
+
+      function switchAuthView(view) {
+        S("global-msg").innerText = "";
+        if (view === "login") {
+          S("main-auth-toggle").style.display = "flex";
+          S("toggle-student").classList.add("active");
+          S("toggle-faculty").classList.remove("active");
+          show("login-form");
+          hide("register-form");
+          hide("faculty-form");
+          hide("forgot-form");
+          hide("forced-reset-form");
+        } else if (view === "forgot") {
+          S("main-auth-toggle").style.display = "none";
+          hide("login-form");
+          hide("register-form");
+          hide("faculty-form");
+          hide("forced-reset-form");
+          show("forgot-form");
+          show("forgot-step-1");
+          hide("forgot-step-2");
+        } else if (view === "register") {
+          S("main-auth-toggle").style.display = "none";
+          hide("login-form");
+          show("register-form");
+          hide("faculty-form");
+          hide("forgot-form");
+          hide("forced-reset-form");
+        } else if (view === "faculty") {
+          S("main-auth-toggle").style.display = "flex";
+          S("toggle-student").classList.remove("active");
+          S("toggle-faculty").classList.add("active");
+          hide("login-form");
+          hide("register-form");
+          show("faculty-form");
+          hide("forgot-form");
+          hide("forced-reset-form");
+        } else if (view === "forced-reset") {
+          S("main-auth-toggle").style.display = "none";
+          hide("login-form");
+          hide("register-form");
+          hide("faculty-form");
+          hide("forgot-form");
+          show("forced-reset-form");
+          show("fr-step-1");
+          hide("fr-step-email");
+          hide("fr-step-2");
+        }
+      }
+
+      function handleRegister() {
+        const id = S("reg-id").value.trim(),
+          bdate = S("reg-bdate").value,
+          pass = S("reg-pass").value,
+          msg = S("global-msg");
+        if (!id || !bdate || !pass) {
+          msg.innerText = "⚠️ Fill out all fields.";
+          return;
+        }
+        setBtn("btn-register", true, "Register Account");
+        showLoader("Registering...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-register", false, "Register Account");
+            if (!res.success) {
+              msg.innerText = "⚠️ " + res.message;
+              return;
+            }
+            S("login-id").value = id;
+            S("login-pass").value = "";
+            switchAuthView("login");
+            msg.style.color = "var(--forest)";
+            msg.innerText = "✅ " + res.message;
+            setTimeout(() => {
+              msg.style.color = "var(--burg)";
+              msg.innerText = "";
+            }, 5000);
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-register", false, "Register Account");
+            msg.innerText = "⚠️ Error. Please try again.";
+          })
+          .registerStudent(id, bdate, pass);
+      }
+
+      function handleStudentLogin() {
+        const id = S("login-id").value.trim(),
+          pass = S("login-pass").value,
+          msg = S("global-msg");
+        if (!id || !pass) {
+          msg.innerText = "⚠️ Required fields missing.";
+          return;
+        }
+        setBtn("btn-student-login", true, "Log In");
+        showLoader("Authenticating...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            if (!res.success) {
+              hideLoader();
+              setBtn("btn-student-login", false, "Log In");
+              msg.innerText = "⚠️ " + res.message;
+              return;
+            }
+            if (res.needsPasswordReset) {
+              hideLoader();
+              setBtn("btn-student-login", false, "Log In");
+              S("fr-id").value = id;
+              switchAuthView("forced-reset");
+              return;
+            }
+            state.id = id;
+            state.token = res.token;
+            state.name = res.studentName;
+            state.subjects = res.subjects;
+            state.isFaculty = false;
+            state.schedule = res.schedule || [];
+            saveSession();
+            runScheduleLoop();
+
+            S("subj-student-name").innerText = state.name;
+            S("btn-back-dash").innerText = "← Back";
+            S("btn-back-dash").onclick = backToProfile;
+
+            google.script.run
+              .withSuccessHandler((pic) => {
+                hideLoader();
+                setBtn("btn-student-login", false, "Log In");
+                if (pic) {
+                  S("dash-avatar-img").src = pic;
+                  show("dash-avatar-img");
+                } else hide("dash-avatar-img");
+
+                state.profile = res.profile || {
+                  fatherName: "",
+                  fatherContact: "",
+                  motherName: "",
+                  motherContact: "",
+                  address: "",
+                  email: "",
+                };
+
+                const p = state.profile;
+                const isComplete =
+                  p.fatherName &&
+                  p.fatherContact &&
+                  p.motherName &&
+                  p.motherContact &&
+                  p.address &&
+                  p.email;
+
+                hide("search-screen");
+                show("profile-screen");
+                show("main-container");
+                window.scrollTo(0, 0);
+
+                if (isComplete) {
+                  proceedToSubjects();
+                } else {
+                  populateProfileEdit();
+                  show("profile-edit-mode");
+                  hide("profile-view-mode");
+                  S("btn-cancel-profile").style.display = "none";
+                  S("btn-close-profile-modal").style.display = "none";
+                  show("profile-screen");
+                }
+              })
+              .withFailureHandler(() => {
+                hideLoader();
+                setBtn("btn-student-login", false, "Log In");
+                hide("dash-avatar-img");
+
+                state.profile = res.profile || {
+                  fatherName: "",
+                  fatherContact: "",
+                  motherName: "",
+                  motherContact: "",
+                  address: "",
+                  email: "",
+                };
+                const p = state.profile;
+                const isComplete =
+                  p.fatherName &&
+                  p.fatherContact &&
+                  p.motherName &&
+                  p.motherContact &&
+                  p.address &&
+                  p.email;
+
+                hide("search-screen");
+                show("profile-screen");
+                show("main-container");
+                window.scrollTo(0, 0);
+
+                if (isComplete) {
+                  proceedToSubjects();
+                } else {
+                  populateProfileEdit();
+                  show("profile-edit-mode");
+                  hide("profile-view-mode");
+                  S("btn-cancel-profile").style.display = "none";
+                  S("btn-close-profile-modal").style.display = "none";
+                  show("profile-screen");
+                }
+              })
+              .getStudentAvatar(id, state.token);
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-student-login", false, "Log In");
+            msg.innerText = "⚠️ Error. Please try again.";
+          })
+          .loginStudent(id, pass);
+      }
+
+      function handleFacultyLogin() {
+        const id = S("fac-id").value.trim(),
+          pass = S("fac-pass").value,
+          msg = S("global-msg");
+        if (!id || !pass) {
+          msg.innerText = "⚠️ Required fields missing.";
+          return;
+        }
+        setBtn("btn-faculty-login", true, "Log In to LMS");
+        showLoader("Authenticating Faculty...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-faculty-login", false, "Log In to LMS");
+            if (!res.success) {
+              msg.innerText = "⚠️ " + res.message;
+              return;
+            }
+            state.isFaculty = true;
+            state.name = res.facName;
+            state.subjects = res.subjects;
+            saveSession();
+            show("floating-logout");
+
+            S("fac-name-display").innerText = "Logged in as: " + res.facName;
+            S("subj-student-name").innerText = "Professor " + res.facName;
+            renderSubjectList();
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-faculty-login", false, "Log In to LMS");
+            msg.innerText = "⚠️ Error. Please try again.";
+          })
+          .loginFaculty(id, pass);
+      }
+
+      function renderSubjectList() {
+        const list = S("subject-list");
+        list.innerHTML = "";
+        state.subjects.forEach((sub, i) => {
+          let card = document.createElement("button");
+          card.className = "path-card pop-in";
+          card.style.animationDelay = `${i * 0.1}s`;
+          card.onclick = () =>
+            state.isFaculty
+              ? loadFacultyDashboard(sub.code, sub.name)
+              : loadSubjectDashboard(sub.code);
+          card.innerText = sub.code;
+          list.appendChild(card);
+        });
+
+        if (state.isFaculty) {
+          hide("fac-utilities");
+          const profBtn = document.querySelector(
+            "#subject-list + div button:first-child",
+          );
+          if (profBtn && profBtn.innerText.includes("Profile")) {
+            profBtn.style.display = "none";
+          }
+        } else {
+          hide("fac-utilities");
+          const profBtn = document.querySelector("#btn-back-to-prof-real");
+          if (profBtn) {
+            profBtn.style.display = "none";
+          }
+        }
+
+        hide("search-screen");
+        hide("profile-screen");
+        show("subject-screen");
+        show("main-container");
+        window.scrollTo(0, 0);
+      }
+
+      function generateAttendancePNG(sessionType) {
+        const isAm = sessionType === "morning";
+        const btnId = isAm ? "btn-gen-am" : "btn-gen-pm";
+        const defaultLabel = isAm ? "📥 Morning PNG" : "📥 Afternoon PNG";
+        const dateInput = S(isAm ? "report-date-am" : "report-date-pm");
+        const dateStr = dateInput.value;
+
+        if (!dateStr) {
+          alert("Please select a date first.");
+          return;
+        }
+
+        setBtn(btnId, true, "Generating...");
+        showLoader(`Compiling ${isAm ? "Morning" : "Afternoon"} Report...`);
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            if (!res.success) {
+              hideLoader();
+              setBtn(btnId, false, defaultLabel);
+              alert("Error generating report: " + res.message);
+              return;
+            }
+
+            const dObj = new Date(dateStr + "T00:00:00");
+            S("rt-date").innerText = dObj.toLocaleDateString("en-US", {
+              weekday: "long",
+              month: "long",
+              day: "numeric",
+              year: "numeric",
+            });
+            S("rt-session").innerText = isAm
+              ? "Morning Session"
+              : "Afternoon Session";
+
+            const buildList = (arr) =>
+              arr.length > 0
+                ? arr.map((n) => `<li>${n}</li>`).join("")
+                : '<div class="report-empty">None recorded</div>';
+
+            const targetData = isAm ? res.data.morning : res.data.afternoon;
+            S("rt-pres").innerHTML = buildList(targetData.present);
+            S("rt-abs").innerHTML = buildList(targetData.absent);
+
+            setTimeout(() => {
+              const canvasEl = S("report-template-container");
+              html2canvas(canvasEl, { scale: 2, backgroundColor: "#f5f0e8" })
+                .then((canvas) => {
+                  hideLoader();
+                  setBtn(btnId, false, defaultLabel);
+
+                  const link = document.createElement("a");
+                  link.download = `Grade11_${isAm ? "Morning" : "Afternoon"}_Attendance_${dateStr}.png`;
+                  link.href = canvas.toDataURL("image/png");
+                  link.click();
+                })
+                .catch((err) => {
+                  hideLoader();
+                  setBtn(btnId, false, defaultLabel);
+                  alert("Failed to render PNG image.");
+                });
+            }, 100);
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn(btnId, false, defaultLabel);
+            alert("Connection error while fetching attendance.");
+          })
+          .fetchDailyAttendanceReport(dateStr, state.token);
+      }
+
+      function loadFacultyDashboard(code, name) {
+        showLoader("Loading Roster...");
+        state.activeSubj = code;
+        state.viewedStudentId = "";
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (!res.success) {
+              alert(res.message);
+              return;
+            }
+            hide("main-container");
+            show("faculty-dashboard");
+
+            let today = new Date().toISOString().split("T")[0];
+            if (!S("report-date-am").value) S("report-date-am").value = today;
+            if (!S("report-date-pm").value) S("report-date-pm").value = today;
+
+            const facUtils = S("fac-utilities");
+            const facContainer = document.querySelector(".fac-container");
+            if (
+              facUtils &&
+              facContainer &&
+              facUtils.parentNode !== facContainer
+            ) {
+              facContainer.insertBefore(facUtils, facContainer.firstChild);
+            }
+            show("fac-utilities");
+
+            S("fac-subj-title").innerText = name + " (" + code + ")";
+            window.scrollTo(0, 0);
+            renderDataViews(res.sheetData);
+            startAutoRefresh();
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            alert("Error fetching roster");
+          })
+          .fetchSubjectRoster(code, state.token);
+      }
+
+      function switchFacView(view) {
+        S("fac-tab-overview").classList.toggle("active", view === "overview");
+        S("fac-tab-list").classList.toggle("active", view === "list");
+        if (view === "overview") {
+          show("fac-overview-view");
+          hide("fac-list-view");
+        } else {
+          hide("fac-overview-view");
+          show("fac-list-view");
+        }
+      }
+
+      function renderDataViews(data, isSilent = false) {
+        const table = S("fac-data-table");
+        const cardGrid = S("fac-student-cards");
+
+        if (data.length === 0) {
+          if (!isSilent) {
+            table.innerHTML = "";
+            cardGrid.innerHTML = "";
+          }
+          return;
+        }
+
+        let tempTableHTML = "<tr>";
+        data[0].forEach((h) => {
+          tempTableHTML += `<th>${h}</th>`;
+        });
+        tempTableHTML += "</tr>";
+
+        let cardsHTML = "";
+        let studentIds = [];
+
+        for (let r = 1; r < data.length; r++) {
+          tempTableHTML += "<tr>";
+          const studentId = String(data[r][1]).trim();
+          const studentName = String(data[r][2]).trim();
+
+          if (studentId && studentId !== "-") {
+            studentIds.push(studentId);
+          }
+
+          data[r].forEach((val, c) => {
+            let cellClass = "";
+            let cellInner = val === "" ? "-" : val;
+
+            if (c === 2 && studentId !== "-") {
+              cellInner = `<span class="fac-student-link" onclick="openStudentView('${studentId}')">📋 ${val}</span>`;
+            } else if (c > 3 && studentId !== "-") {
+              cellClass = "editable";
+            }
+
+            if (cellClass) {
+              tempTableHTML += `<td class="${cellClass}" onclick="openEditModal(${r}, ${c}, '${data[0][c]}', '${val}')">${cellInner}</td>`;
+            } else {
+              tempTableHTML += `<td>${cellInner}</td>`;
+            }
+          });
+          tempTableHTML += "</tr>";
+
+          if (studentId && studentId !== "-") {
+            cardsHTML += `
+        <div class="fac-list-card pop-in" style="animation-delay:${isSilent ? 0 : (r % 10) * 0.05}s" onclick="openStudentView('${studentId}')">
+          <div class="fac-avatar" id="fac-card-img-${studentId}">🎓</div>
+          <div class="fac-info">
+            <div class="fac-name">${studentName}</div>
+            <div class="fac-id">${studentId}</div>
+          </div>
+          <div style="font-size:16px; color:var(--gold-dark); opacity:0.7; padding-left:10px;">➔</div>
+        </div>
+      `;
+          }
+        }
+
+        table.innerHTML = tempTableHTML;
+        cardGrid.innerHTML = cardsHTML;
+
+        if (studentIds.length > 0 && !isSilent) {
+          google.script.run
+            .withSuccessHandler((avatars) => {
+              for (let id in avatars) {
+                let el = S("fac-card-img-" + id);
+                if (el && avatars[id]) {
+                  el.innerHTML = `<img src="${avatars[id]}">`;
+                }
+              }
+            })
+            .getMultipleAvatars(studentIds, state.token);
+        }
+      }
+
+      function openEditModal(rIndex, cIndex, headerName, currentVal) {
+        state.editTarget = { r: rIndex, c: cIndex };
+        S("edit-target-label").innerText = "Editing: " + headerName;
+        S("edit-input").value = currentVal === "-" ? "" : currentVal;
+        show("edit-modal");
+        S("edit-input").focus();
+      }
+
+      function saveEdit() {
+        const newVal = S("edit-input").value;
+        hide("edit-modal");
+        showLoader("Saving...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            if (res.success) {
+              google.script.run
+                .withSuccessHandler((r2) => {
+                  hideLoader();
+                  renderDataViews(r2.sheetData);
+                })
+                .fetchSubjectRoster(state.activeSubj, state.token);
+            } else {
+              hideLoader();
+              alert("Save failed: " + res.message);
+            }
+          })
+          .updateCellData(
+            state.activeSubj,
+            state.editTarget.r,
+            state.editTarget.c,
+            newVal,
+            state.token
+          );
+      }
+
+      function navigateFacultyBack() {
+        state.activeSubj = "";
+        state.viewedStudentId = "";
+        stopAutoRefresh();
+        hide("faculty-dashboard");
+        show("main-container");
+        show("subject-screen");
+        window.scrollTo(0, 0);
+      }
+
+      function openStudentView(studentId) {
+        showLoader("Loading Student Record...");
+        state.viewedStudentId = studentId;
+        S("btn-back-dash").innerText = "← Back to Roster";
+        S("btn-back-dash").onclick = () => {
+          state.viewedStudentId = "";
+          hide("main-container");
+          hide("dashboard-screen");
+          show("faculty-dashboard");
+        };
+
+        S("mod-reviewers-content").innerHTML =
+          '<div class="empty-state">Loading reviewers...</div>';
+
+        S("btn-remove-avatar").style.display = "none";
+        S("btn-upload-avatar").style.display = "none";
+        S("avatar-wrap-el").classList.add("no-edit");
+
+        google.script.run
+          .withSuccessHandler((pic) => {
+            if (pic) {
+              S("dash-avatar-img").src = pic;
+              show("dash-avatar-img");
+            } else hide("dash-avatar-img");
+          })
+          .withFailureHandler(() => {
+            hide("dash-avatar-img");
+          })
+          .getStudentAvatar(studentId, state.token);
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (!res.success) {
+              alert(res.message);
+              return;
+            }
+            hide("faculty-dashboard");
+            show("main-container");
+            window.scrollTo(0, 0);
+            populateDashboardUI(res);
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            alert("Error fetching data");
+          })
+          .fetchSubjectData(studentId, state.activeSubj, true, state.token);
+      }
+
+      function loadSubjectDashboard(code) {
+        showLoader("Loading...");
+        state.activeSubj = code;
+        S("mod-reviewers-content").innerHTML =
+          '<div class="empty-state">Loading reviewers...</div>';
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (!res.success) {
+              alert(res.message);
+              return;
+            }
+            hide("search-screen");
+            hide("subject-screen");
+            hide("profile-screen");
+            S("btn-remove-avatar").style.display = "block";
+            S("btn-upload-avatar").style.display = "block";
+            S("avatar-wrap-el").classList.remove("no-edit");
+            populateDashboardUI(res);
+            startAutoRefresh();
+          })
+          .withFailureHandler(() => hideLoader())
+          .fetchSubjectData(state.id, code, false, state.token);
+      }
+
+      function getFileIcon(mimeType) {
+        if (!mimeType) return "📁";
+        if (mimeType.includes("pdf")) return "📄";
+        if (
+          mimeType.includes("presentation") ||
+          mimeType.includes("powerpoint")
+        )
+          return "📊";
+        if (mimeType.includes("document") || mimeType.includes("word"))
+          return "📝";
+        if (mimeType.includes("spreadsheet") || mimeType.includes("excel"))
+          return "📈";
+        if (mimeType.includes("image")) return "🖼️";
+        return "📁";
+      }
+
+      function populateDashboardUI(res, isSilent = false) {
+        S("dash-subject-name").innerText = res.subjectName;
+
+        if (state.isFaculty) {
+          if(S("btn-view-profile")) S("btn-view-profile").style.display = "none";
+          if(S("btn-download-qr")) S("btn-download-qr").style.display = "none";
+          let formattedName = res.studentName;
+          if (formattedName.includes(",")) {
+            let parts = formattedName.split(",");
+            formattedName =
+              parts[0].trim().toUpperCase() +
+              ", " +
+              parts[1].trim().toUpperCase();
+          }
+          S("dash-greeting").innerText = formattedName;
+
+          let subjectFullDesc = res.subjectName;
+          if (subjectFullDesc.toUpperCase() === "PHILO")
+            subjectFullDesc = "Introduction to Philosophy of Human Person";
+          if (subjectFullDesc.toUpperCase() === "PKLP")
+            subjectFullDesc = "Pagbasa at Pagsusuri sa Iba't Ibang Teksto";
+          if (subjectFullDesc.toUpperCase() === "PGP")
+            subjectFullDesc = "Personal Development";
+          S("dash-subject-name").innerText = subjectFullDesc;
+
+          show("tab-btn-eval");
+          document.querySelector(".dash-profile-card").classList.add("compact");
+        } else {
+          let fName = res.studentName.includes(",")
+            ? res.studentName.split(",")[1].trim()
+            : res.studentName.split(" ")[0];
+          S("dash-greeting").innerText = fName;
+          hide("tab-btn-eval");
+          if(S("btn-view-profile")) S("btn-view-profile").style.display = "inline-block";
+          if(S("btn-download-qr")) S("btn-download-qr").style.display = "inline-block";
+          document
+            .querySelector(".dash-profile-card")
+            .classList.remove("compact");
+        }
+
+        if (res.evaluation) {
+          S("eval-status").innerText = res.evaluation.status;
+          S("eval-details").innerText = res.evaluation.details;
+
+          let statusColor = "var(--forest)";
+          if (res.evaluation.status.includes("Exceeds"))
+            statusColor = "#1a5c38";
+          else if (res.evaluation.status.includes("Developing"))
+            statusColor = "var(--gold-dark)";
+          else if (res.evaluation.status.includes("Below Basic"))
+            statusColor = "var(--burg)";
+          S("eval-status").style.color = statusColor;
+        }
+
+        const rs = (valObj) => {
+          let score, maxScore;
+          if (typeof valObj === 'object' && valObj !== null) {
+              score = valObj.score;
+              maxScore = valObj.maxScore;
+          } else {
+              score = valObj;
+          }
+          if (score === null || score === "" || score === undefined || String(score).trim().toLowerCase() === "undefined") {
+              return `<div class="tile-missing">No Record</div>`;
+          }
+          if (maxScore !== null && maxScore !== undefined && maxScore !== "") {
+              return `<div class="tile-score">${score} <span style="font-size: 0.6em; color: var(--ink-3);">/ ${maxScore}</span></div>`;
+          }
+          return `<div class="tile-score">${score}</div>`;
+        };
+
+        S("mod-recitations").innerText = res.recitations;
+        state.dailyProgress = res.dailyProgress || [];
+        state.alternatives = res.alternatives || {};
+
+        if (!isSilent) {
+          const filterSelect = S("week-filter");
+          filterSelect.innerHTML = '<option value="all">All Weeks</option>';
+          if (state.dailyProgress.length > 0) {
+            const weeks = [
+              ...new Set(state.dailyProgress.map((item) => item.week)),
+            ].sort();
+            weeks.forEach((week) => {
+              filterSelect.innerHTML += `<option value="${week}">${week}</option>`;
+            });
+          }
+        }
+
+        renderDailyProgress(isSilent);
+
+        let majorsHtml = "";
+        let mIdx = 0;
+        if (res.majors.SA1 !== undefined)
+          majorsHtml += `<div class="tile pop-in" style="animation-delay:${mIdx++ * 0.05}s"><div class="tile-name">SA1</div>${rs(res.majors.SA1)}</div>`;
+        if (res.majors.SA2 !== undefined)
+          majorsHtml += `<div class="tile pop-in" style="animation-delay:${mIdx++ * 0.05}s"><div class="tile-name">SA2</div>${rs(res.majors.SA2)}</div>`;
+        if (res.majors.PE !== undefined)
+          majorsHtml += `<div class="tile pop-in" style="animation-delay:${mIdx++ * 0.05}s"><div class="tile-name">PE</div>${rs(res.majors.PE)}</div>`;
+
+        S("mod-majors-content").innerHTML = res.hasMajors
+          ? `<div class="score-grid">${majorsHtml}</div>`
+          : `<div class="empty-state">No major assessments recorded.</div>`;
+
+        state.attendance = res.attendance || {
+          records: [],
+          totalPresent: 0,
+          totalAbsent: 0,
+        };
+
+        if (!isSilent) {
+          const monthSelect = S("att-month-filter");
+          monthSelect.innerHTML = '<option value="all">All Months</option>';
+          if (state.attendance.records.length > 0) {
+            const months = [
+              ...new Set(
+                state.attendance.records.map((r) => r.date.split(" ")[0]),
+              ),
+            ];
+            months.forEach((month) => {
+              monthSelect.innerHTML += `<option value="${month}">${month}</option>`;
+            });
+          }
+        }
+
+        renderAttendance(isSilent);
+
+        if (!isSilent) {
+          show("dashboard-screen");
+          window.scrollTo(0, 0);
+          switchTab("att");
+        }
+
+        if (!isSilent) {
+          google.script.run
+            .withSuccessHandler((revRes) => {
+              const container = S("mod-reviewers-content");
+              if (
+                !revRes.success ||
+                !revRes.files ||
+                revRes.files.length === 0
+              ) {
+                container.innerHTML =
+                  '<div class="empty-state">No reviewers available for this subject.</div>';
+                return;
+              }
+
+              let html = '';
+              let groupedFiles = {};
+              revRes.files.forEach(file => {
+                  let match = file.name.match(/W(\d+)/i);
+                  let week = match ? "Week " + match[1] : "Other";
+                  if (!groupedFiles[week]) {
+                      groupedFiles[week] = [];
+                  }
+                  groupedFiles[week].push(file);
+              });
+
+              let sortedWeeks = Object.keys(groupedFiles).sort((a, b) => {
+                  if (a === "Other") return 1;
+                  if (b === "Other") return -1;
+                  let numA = parseInt(a.replace("Week ", ""));
+                  let numB = parseInt(b.replace("Week ", ""));
+                  return numA - numB;
+              });
+
+              let animIdx = 0;
+              sortedWeeks.forEach(week => {
+                  html += `<div style="font-size: 14px; font-weight: 800; color: var(--forest); margin: 20px 22px 5px; text-transform: uppercase; border-bottom: 2px solid var(--rule-med); padding-bottom: 5px;">${week}</div>`;
+                  html += '<div class="reviewer-grid" style="padding-top: 10px;">';
+                  groupedFiles[week].forEach(file => {
+                      let mime = file.mimeType || "";
+                      let icon = getFileIcon(mime);
+                      let typeStr = mime ? mime.split("/").pop().toUpperCase().substring(0, 3) : "UNK";
+                      if (typeStr === "VND") typeStr = "DOC";
+
+                      html += `
+                <div class="reviewer-card pop-in" style="animation-delay:${animIdx * 0.05}s;" onclick="openReviewerOptions('${file.id}', '${file.name.replace(/'/g, "\\'")}', '${file.url}', '${typeStr}', '${mime}')">
+                  <div class="reviewer-icon">${icon}</div>
+                  <div class="reviewer-info">
+                    <div class="reviewer-name" title="${file.name}">${file.name}</div>
+                    <div class="reviewer-type">${typeStr} FILE</div>
+                  </div>
+                </div>
+              `;
+                      animIdx++;
+                  });
+                  html += "</div>";
+              });
+              container.innerHTML = html;
+            })
+            .withFailureHandler((err) => {
+              S("mod-reviewers-content").innerHTML =
+                '<div class="empty-state">Failed to load reviewers.</div>';
+            })
+            .fetchReviewerFiles(res.subjectCode, state.token);
+        }
+      }
+
+      function renderAttendance(isSilent = false) {
+        const selectedMonth = S("att-month-filter")
+          ? S("att-month-filter").value
+          : "all";
+        let filteredRecords = state.attendance.records || [];
+
+        if (selectedMonth !== "all") {
+          filteredRecords = state.attendance.records.filter((r) =>
+            r.date.startsWith(selectedMonth),
+          );
+        }
+
+        let totalPresent = filteredRecords.filter(
+          (r) => r.status === "present",
+        ).length;
+        let totalAbsent = filteredRecords.filter(
+          (r) => r.status === "absent",
+        ).length;
+
+        if (selectedMonth === "all") {
+          totalPresent = state.attendance.totalPresent;
+          totalAbsent = state.attendance.totalAbsent;
+        }
+
+        S("att-pres-count").innerText = totalPresent;
+        S("att-abs-count").innerText = totalAbsent;
+
+        S("mod-att-cal").innerHTML = filteredRecords.length
+          ? filteredRecords
+              .map(
+                (r, i) =>
+                  `<div class="cal-day pop-in" style="animation-delay:${i * 0.05}s"><div class="cal-date">${r.date}</div><div class="cal-dot ${r.status === "present" ? "green" : "red"}"></div></div>`,
+              )
+              .join("")
+          : '<div style="grid-column:1/-1;text-align:center;padding:16px;">No records.</div>';
+
+        if (!isSilent) {
+          if (attChartInstance) attChartInstance.destroy();
+          if (totalPresent > 0 || totalAbsent > 0) {
+            const ctx = S("attendanceChart").getContext("2d");
+            attChartInstance = new Chart(ctx, {
+              type: "doughnut",
+              data: {
+                labels: ["Present", "Absent"],
+                datasets: [
+                  {
+                    data: [totalPresent, totalAbsent],
+                    backgroundColor: ["#1a5c38", "#8b1a1a"],
+                    borderWidth: 0,
+                  },
+                ],
+              },
+              options: {
+                responsive: true,
+                plugins: { legend: { position: "bottom" } },
+                animation: { duration: 0 },
+              },
+            });
+          } else if (attChartInstance) {
+            attChartInstance.destroy();
+            attChartInstance = null;
+          }
+        } else {
+          if (attChartInstance && (totalPresent > 0 || totalAbsent > 0)) {
+            attChartInstance.data.datasets[0].data = [
+              totalPresent,
+              totalAbsent,
+            ];
+            attChartInstance.update("none");
+          }
+        }
+      }
+
+      function renderDailyProgress(isSilent = false) {
+        const selectedWeek = S("week-filter").value;
+        let filteredData = state.dailyProgress;
+
+        if (selectedWeek !== "all") {
+          filteredData = state.dailyProgress.filter(
+            (item) => item.week === selectedWeek,
+          );
+        }
+
+        const getTileContent = (val, maxScore) => {
+          if (val === null || val === "" || val === undefined || String(val).trim().toLowerCase() === "undefined") {
+              return `<div class="tile-missing">No Record</div>`;
+          }
+          if (maxScore !== null && maxScore !== undefined && maxScore !== "") {
+              return `<div class="tile-score">${val} <span style="font-size: 0.6em; color: var(--ink-3);">/ ${maxScore}</span></div>`;
+          }
+          return `<div class="tile-score">${val}</div>`;
+        };
+
+        S("mod-daily-grid").innerHTML = filteredData.length
+          ? filteredData
+              .map(
+                (item, i) => {
+                  let isMissing = (item.score === null || item.score === "" || item.score === undefined || String(item.score).trim().toLowerCase() === "undefined");
+                  let clickHandler = "";
+                  let tileStyle = "";
+                  if (isMissing) {
+                      let weekKey = String(item.week).toUpperCase();
+                      let altLink = state.alternatives[weekKey];
+                      clickHandler = altLink
+                          ? `onclick="window.open('${altLink}', '_blank')"`
+                          : `onclick="alert('Activity is not yet available')"`;
+                      tileStyle = "cursor: pointer; text-decoration: underline;";
+                  }
+                  return `<div class="tile pop-in" style="animation-delay:${i * 0.05}s; ${tileStyle}" ${clickHandler}><div class="tile-name">${item.name}</div>${getTileContent(item.score, item.maxScore)}</div>`;
+                }
+              )
+              .join("")
+          : '<div style="grid-column:1/-1;text-align:center;padding:16px;">No records.</div>';
+
+        if (!isSilent) {
+          if (dailyChartInstance) dailyChartInstance.destroy();
+          if (filteredData.length > 0) {
+            const labels = filteredData.map((item) => item.name);
+            const scores = filteredData.map(
+              (item) => parseFloat(item.score) || 0,
+            );
+
+            const ctx = S("dailyProgressChart").getContext("2d");
+            dailyChartInstance = new Chart(ctx, {
+              type: "bar",
+              data: {
+                labels: labels,
+                datasets: [
+                  {
+                    label: "Score",
+                    data: scores,
+                    backgroundColor: "#c9a84c",
+                    borderRadius: 4,
+                  },
+                ],
+              },
+              options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                  y: { beginAtZero: true },
+                },
+                animation: { duration: 0 },
+              },
+            });
+          }
+        } else {
+          if (dailyChartInstance && filteredData.length > 0) {
+            dailyChartInstance.data.labels = filteredData.map(
+              (item) => item.name,
+            );
+            dailyChartInstance.data.datasets[0].data = filteredData.map(
+              (item) => parseFloat(item.score) || 0,
+            );
+            dailyChartInstance.update("none");
+          }
+        }
+      }
+
+      function switchTab(t) {
+        document
+          .querySelectorAll(".tab-btn")
+          .forEach((b) => b.classList.remove("active"));
+        S("tab-btn-" + t).classList.add("active");
+        document.querySelectorAll(".module-container").forEach((m) => {
+          m.classList.remove("active");
+          void m.offsetWidth;
+        });
+        S("mod-" + t).classList.add("active");
+      }
+
+      function openAvatarMenu() {
+        if (state.isFaculty) return;
+        show("avatar-menu-modal");
+      }
+
+      function handleFileSelect(e) {
+        const f = e.target.files[0];
+        if (!f) return;
+        if (f.size > 3000000) {
+          alert("Image too large (Max 3MB).");
+          return;
+        }
+
+        hide("avatar-menu-modal");
+        const r = new FileReader();
+        r.onload = (ev) => {
+          S("crop-image").src = ev.target.result;
+          show("crop-modal");
+          if (cropper) cropper.destroy();
+          cropper = new Cropper(S("crop-image"), {
+            aspectRatio: 1,
+            viewMode: 1,
+            background: false,
+          });
+        };
+        r.readAsDataURL(f);
+        S("pic-upload").value = "";
+      }
+
+      function cancelCrop() {
+        hide("crop-modal");
+        if (cropper) {
+          cropper.destroy();
+          cropper = null;
+        }
+      }
+
+      function applyCrop() {
+        if (!cropper) return;
+        hide("crop-modal");
+        showLoader("Uploading...");
+        const canvas = cropper.getCroppedCanvas({ width: 300, height: 300 });
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+        cropper.destroy();
+        cropper = null;
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success) {
+              S("dash-avatar-img").src = dataUrl;
+              show("dash-avatar-img");
+            } else alert(res.message);
+          })
+          .withFailureHandler(() => hideLoader())
+          .uploadStudentAvatar(state.id, dataUrl, state.token);
+      }
+
+      function removeAvatar() {
+        hide("avatar-menu-modal");
+        showLoader("Removing...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success) {
+              hide("dash-avatar-img");
+              S("dash-avatar-img").src = "";
+            }
+          })
+          .withFailureHandler(() => hideLoader())
+          .removeStudentAvatar(state.id, state.token);
+      }
+
+      function proceedToSubjects() {
+        hide("profile-screen");
+        if (state.subjects.length === 1) {
+          loadSubjectDashboard(state.subjects[0].code);
+        } else {
+          renderSubjectList();
+        }
+      }
+
+      function backToProfile() {
+        hide("dashboard-screen");
+        hide("subject-screen");
+        show("main-container");
+        if (state.subjects.length > 1) {
+            show("subject-screen");
+        } else {
+            resetApp();
+        }
+        window.scrollTo(0, 0);
+      }
+
+      function backToSubjects() {
+        hide("dashboard-screen");
+        if (state.subjects.length > 1) {
+          show("main-container");
+          show("subject-screen");
+          window.scrollTo(0, 0);
+
+          S("btn-back-to-prof-real").onclick = backToProfile;
+        } else {
+          backToProfile();
+        }
+      }
+
+      function resetApp() {
+        sessionStorage.removeItem("portalSession");
+        hide("dashboard-screen");
+        hide("subject-screen");
+        hide("profile-screen");
+        hide("faculty-dashboard");
+        hide("maintenance-screen");
+        show("main-container");
+        show("search-screen");
+        switchAuthView("login");
+        S("login-id").value = "";
+        S("login-pass").value = "";
+        S("fac-id").value = "";
+        S("fac-pass").value = "";
+        S("reg-id").value = "";
+        S("reg-bdate").value = "";
+        S("reg-pass").value = "";
+        state = {
+          id: "",
+          name: "",
+          subjects: [],
+          activeSubj: "",
+          isFaculty: false,
+          editTarget: null,
+          dailyProgress: [],
+          schedule: [],
+        };
+        if (scheduleInterval) {
+          clearInterval(scheduleInterval);
+          scheduleInterval = null;
+        }
+        hide("floating-timer");
+        S("in-class-modal").classList.remove("active");
+        hide("floating-logout");
+        if (attChartInstance) {
+          attChartInstance.destroy();
+          attChartInstance = null;
+        }
+        if (dailyChartInstance) {
+          dailyChartInstance.destroy();
+          dailyChartInstance = null;
+        }
+        hide("dash-avatar-img");
+        S("dash-avatar-img").src = "";
+        S("btn-remove-avatar").style.display = "block";
+        S("btn-upload-avatar").style.display = "block";
+        S("avatar-wrap-el").classList.remove("no-edit");
+        window.scrollTo(0, 0);
+      }
+
+      function handleFRVerify() {
+        const id = S("fr-id").value.trim();
+        const bdate = S("fr-bdate").value;
+        const msg = S("global-msg");
+
+        if (!id || !bdate) {
+          msg.innerText = "⚠️ Please enter your Birthdate.";
+          return;
+        }
+
+        setBtn("btn-fr-verify", true, "Verifying...");
+        showLoader("Verifying Identity...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-fr-verify", false, "Verify Identity");
+            if (res.success) {
+              msg.innerText = "";
+              if (res.email) {
+                // Email exists, proceed to OTP directly
+                handleFRSendOTP(id);
+              } else {
+                // Email missing, prompt to register one
+                hide("fr-step-1");
+                show("fr-step-email");
+              }
+            } else {
+              msg.innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-fr-verify", false, "Verify Identity");
+            msg.innerText = "⚠️ Error verifying identity.";
+          })
+          .checkStudentRegistrationForReset(id, bdate);
+      }
+
+      function handleFRRegisterEmail() {
+        const id = S("fr-id").value.trim();
+        const bdate = S("fr-bdate").value;
+        const email = S("fr-email").value.trim();
+        const msg = S("global-msg");
+
+        if (!email) {
+          msg.innerText = "⚠️ Please provide an active email.";
+          return;
+        }
+
+        setBtn("btn-fr-send-email", true, "Registering...");
+        showLoader("Registering Email...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-fr-send-email", false, "Register Email & Send OTP");
+            if (res.success) {
+              msg.innerText = "";
+              hide("fr-step-email");
+              show("fr-step-2");
+            } else {
+              msg.innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-fr-send-email", false, "Register Email & Send OTP");
+            msg.innerText = "⚠️ Error registering email.";
+          })
+          .registerEmailAndSendOTP(id, bdate, email);
+      }
+
+      function handleFRSendOTP(id) {
+        showLoader("Sending OTP to your email...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            if (res.success) {
+              hide("fr-step-1");
+              show("fr-step-2");
+            } else {
+              S("global-msg").innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            S("global-msg").innerText = "⚠️ Error sending OTP.";
+          })
+          .generateAndSendOTP(id);
+      }
+
+      function handleFRReset() {
+        const id = S("fr-id").value.trim();
+        const otp = S("fr-otp").value.trim();
+        const newPass = S("fr-new-pass").value;
+        const msg = S("global-msg");
+
+        if (!otp || !newPass) {
+          msg.innerText = "⚠️ Please enter OTP and new password.";
+          return;
+        }
+
+        setBtn("btn-fr-reset", true, "Resetting...");
+        showLoader("Securing Account...");
+        google.script.run
+          .withSuccessHandler((res) => {
+            hideLoader();
+            setBtn("btn-fr-reset", false, "Reset Password");
+            if (res.success) {
+              switchAuthView("login");
+              msg.style.color = "var(--forest)";
+              msg.innerText = "✅ Password reset successfully! Please log in with your new password.";
+              setTimeout(() => {
+                msg.style.color = "var(--burg)";
+                msg.innerText = "";
+              }, 5000);
+            } else {
+              msg.innerText = "⚠️ " + res.message;
+            }
+          })
+          .withFailureHandler(() => {
+            hideLoader();
+            setBtn("btn-fr-reset", false, "Reset Password");
+            msg.innerText = "⚠️ Error resetting password.";
+          })
+          .verifyOTPAndResetPassword(id, otp, newPass);
+      }
+</script>

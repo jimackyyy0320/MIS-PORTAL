@@ -151,10 +151,14 @@ function syncSwitchTab() {
 }
 
 function doGet(e) {
-  return HtmlService.createHtmlOutputFromFile("Index")
+  return HtmlService.createTemplateFromFile("Index").evaluate()
     .setTitle("Records Portal")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
     .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -259,10 +263,12 @@ function registerStudent(id, bdate, password) {
         };
     }
 
+    const hashedPassword = hashPassword(password);
+
     credSheet.appendRow([
       id,
       bdate,
-      password,
+      hashedPassword,
       new Date().toLocaleDateString("en-US"),
     ]);
     return { success: true, message: "Registration successful!" };
@@ -271,7 +277,12 @@ function registerStudent(id, bdate, password) {
   }
 }
 
-function saveStudentProfile(id, profileData) {
+function saveStudentProfile(id, profileData, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.id !== String(id)) {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     id = String(id).trim();
     if (!id || !profileData)
@@ -352,26 +363,42 @@ function loginStudent(id, password) {
     const credData = credSheet.getDataRange().getValues();
     let valid = false;
     let profileData = null;
+    let needsPasswordReset = false;
+
+    const hashedPassword = hashPassword(password);
 
     for (let i = 1; i < credData.length; i++) {
-      if (
-        String(credData[i][0]).trim() === id &&
-        String(credData[i][2]).trim() === password
-      ) {
-        valid = true;
-        // Fetch existing profile data (Columns G-L are indices 6-11)
-        profileData = {
-          fatherName: credData[i][6] || "",
-          fatherContact: credData[i][7] || "",
-          motherName: credData[i][8] || "",
-          motherContact: credData[i][9] || "",
-          address: credData[i][10] || "",
-          email: credData[i][11] || "",
-        };
-        break;
+      if (String(credData[i][0]).trim() === id) {
+        let storedPassword = String(credData[i][2]).trim();
+
+        if (storedPassword === hashedPassword) {
+          valid = true;
+        } else if (storedPassword === password && storedPassword.length !== 64) {
+          // If it matches the plain text and isn't a SHA-256 hash length, it's a legacy password
+          valid = true;
+          needsPasswordReset = true;
+        }
+
+        if (valid) {
+          // Fetch existing profile data (Columns G-L are indices 6-11)
+          profileData = {
+            fatherName: credData[i][6] || "",
+            fatherContact: credData[i][7] || "",
+            motherName: credData[i][8] || "",
+            motherContact: credData[i][9] || "",
+            address: credData[i][10] || "",
+            email: credData[i][11] || "",
+          };
+          break;
+        }
       }
     }
+
     if (!valid) return { success: false, message: "Invalid ID or Password." };
+
+    if (needsPasswordReset) {
+      return { success: true, needsPasswordReset: true, message: "Security Update: Please reset your password." };
+    }
 
     let studentName = "",
       enrolledSubjects = [];
@@ -448,8 +475,15 @@ function loginStudent(id, password) {
       }
     } catch (e) {}
 
+    const token = generateToken({
+      id: id,
+      role: 'student',
+      exp: Date.now() + 24 * 60 * 60 * 1000 // 24 hours
+    });
+
     return {
       success: true,
+      token: token,
       studentName: studentName,
       subjects: enrolledSubjects,
       schedule: schedule,
@@ -477,17 +511,34 @@ function loginFaculty(id, password) {
 
     const data = facSheet.getDataRange().getValues();
     const subjectsMap = getSubjectsMap();
+    const hashedPassword = hashPassword(password);
     for (let i = 1; i < data.length; i++) {
+      let storedPassword = String(data[i][1]).trim();
+      let isValid = false;
+      if (storedPassword === hashedPassword) {
+        isValid = true;
+      } else if (storedPassword === password && storedPassword.length !== 64) {
+        // Legacy plain-text support for faculty
+        isValid = true;
+      }
+
       if (
-        String(data[i][0]).trim() === id &&
-        String(data[i][1]).trim() === password
+        String(data[i][0]).trim() === id && isValid
       ) {
         let allSubjects = Object.keys(subjectsMap).map((k) => ({
           code: k,
           name: subjectsMap[k].name,
         }));
+
+        const token = generateToken({
+          id: id,
+          role: 'faculty',
+          exp: Date.now() + 24 * 60 * 60 * 1000 // 24 hours
+        });
+
         return {
           success: true,
+          token: token,
           facName: String(data[i][2]).trim(),
           subjects: allSubjects,
         };
@@ -499,7 +550,12 @@ function loginFaculty(id, password) {
   }
 }
 
-function fetchSubjectRoster(subjectCode) {
+function fetchSubjectRoster(subjectCode, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.role !== 'faculty') {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     const subjectsMap = getSubjectsMap();
     const ss = SpreadsheetApp.openById(subjectsMap[subjectCode].id);
@@ -522,7 +578,11 @@ function fetchSubjectRoster(subjectCode) {
   }
 }
 
-function updateCellData(subjectCode, rowIndex, colIndex, newValue) {
+function updateCellData(subjectCode, rowIndex, colIndex, newValue, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.role !== 'faculty') {
+    return { success: false, message: "Unauthorized access." };
+  }
   try {
     const subjectsMap = getSubjectsMap();
     const ss = SpreadsheetApp.openById(subjectsMap[subjectCode].id);
@@ -537,7 +597,11 @@ function updateCellData(subjectCode, rowIndex, colIndex, newValue) {
 // ═══════════════════════════════════════════════════════════════
 //  REVIEWER MODULE
 // ═══════════════════════════════════════════════════════════════
-function fetchReviewerFiles(subjectCode) {
+function fetchReviewerFiles(subjectCode, token) {
+  const payload = verifyToken(token);
+  if (!payload) {
+    return { success: false, message: "Unauthorized access." };
+  }
   try {
     const mainFolder = DriveApp.getFolderById(REVIEWER_FOLDER_ID);
     const subfolders = mainFolder.searchFolders(
@@ -575,7 +639,11 @@ function fetchReviewerFiles(subjectCode) {
 // ═══════════════════════════════════════════════════════════════
 //  GLOBAL ATTENDANCE REPORT (PNG GENERATOR BACKEND)
 // ═══════════════════════════════════════════════════════════════
-function fetchDailyAttendanceReport(dateStr) {
+function fetchDailyAttendanceReport(dateStr, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.role !== 'faculty') {
+    return { success: false, message: "Unauthorized access." };
+  }
   try {
     const subjectsMap = getSubjectsMap();
     let report = {
@@ -669,7 +737,12 @@ function fetchDailyAttendanceReport(dateStr) {
 // ═══════════════════════════════════════════════════════════════
 //  STUDENT DATA FETCHING & AVATARS
 // ═══════════════════════════════════════════════════════════════
-function fetchSubjectData(id, subjectCode, isFaculty) {
+function fetchSubjectData(id, subjectCode, isFaculty, token) {
+  const payload = verifyToken(token);
+  if (!payload || (payload.role !== 'faculty' && payload.id !== String(id))) {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     const subjectsMap = getSubjectsMap();
     const subj = subjectsMap[subjectCode];
@@ -853,7 +926,12 @@ function fetchSubjectData(id, subjectCode, isFaculty) {
   }
 }
 
-function getStudentQRCode(id) {
+function getStudentQRCode(id, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.id !== String(id)) {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     const folderId = "11AZRnI6LkJXKaSx3yBu44pqSUNHetx7d";
     const files = DriveApp.getFolderById(folderId).searchFiles(
@@ -872,7 +950,13 @@ function getStudentQRCode(id) {
   }
 }
 
-function getStudentAvatar(id) {
+function getStudentAvatar(id, token) {
+  const payload = verifyToken(token);
+  // Faculty can fetch any avatar, students can only fetch their own
+  if (!payload || (payload.role !== 'faculty' && payload.id !== String(id))) {
+    return null;
+  }
+
   try {
     const files = DriveApp.getFolderById(PROFILE_FOLDER_ID).searchFiles(
       'title contains "' + id + '"',
@@ -893,8 +977,14 @@ function getStudentAvatar(id) {
 }
 
 // BATCH AVATAR FETCHING FOR FACULTY ROSTER
-function getMultipleAvatars(ids) {
+function getMultipleAvatars(ids, token) {
   let avatars = {};
+
+  const payload = verifyToken(token);
+  if (!payload || payload.role !== 'faculty') {
+    return avatars;
+  }
+
   try {
     // 1. Clean the incoming array to prevent false positives from empty rows
     let validIds = ids.filter((id) => id && id !== "-");
@@ -931,7 +1021,12 @@ function getMultipleAvatars(ids) {
   return avatars;
 }
 
-function uploadStudentAvatar(id, dataUrl) {
+function uploadStudentAvatar(id, dataUrl, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.id !== String(id)) {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     const folder = DriveApp.getFolderById(PROFILE_FOLDER_ID);
     const oldFiles = folder.searchFiles('title contains "' + id + '"');
@@ -950,7 +1045,12 @@ function uploadStudentAvatar(id, dataUrl) {
   }
 }
 
-function removeStudentAvatar(id) {
+function removeStudentAvatar(id, token) {
+  const payload = verifyToken(token);
+  if (!payload || payload.id !== String(id)) {
+    return { success: false, message: "Unauthorized access." };
+  }
+
   try {
     const files = DriveApp.getFolderById(PROFILE_FOLDER_ID).searchFiles(
       'title contains "' + id + '"',
@@ -1071,8 +1171,10 @@ function verifyOTPAndResetPassword(id, otp, newPassword) {
     if (rowIndex === -1) return { success: false, message: "Student ID not found." };
     if (passIndex === -1) return { success: false, message: "Database Error: Password column not found." };
 
+    const hashedNewPassword = hashPassword(newPassword);
+
     // Update password
-    credSheet.getRange(rowIndex, passIndex + 1).setValue(newPassword);
+    credSheet.getRange(rowIndex, passIndex + 1).setValue(hashedNewPassword);
 
     // Update last change date
     if (lastChangeIndex !== -1) {
@@ -1093,6 +1195,148 @@ function fetchRawHtmlContent(fileId) {
     const file = DriveApp.getFileById(fileId);
     return { success: true, content: file.getBlob().getDataAsString() };
   } catch (err) {
+    return { success: false, message: err.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SECURITY: JWT / HMAC TOKENS & HASHING
+// ═══════════════════════════════════════════════════════════════
+
+function getSecretKey() {
+  const props = PropertiesService.getScriptProperties();
+  let secret = props.getProperty('JWT_SECRET');
+  if (!secret) {
+    secret = Utilities.getUuid(); // generate a random secret if none exists
+    props.setProperty('JWT_SECRET', secret);
+  }
+  return secret;
+}
+
+function base64UrlEncode(str) {
+  const bytes = Utilities.newBlob(str).getBytes();
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, '');
+}
+
+function base64UrlEncodeArray(bytes) {
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, '');
+}
+
+function generateToken(payload) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signatureInput = encodedHeader + "." + encodedPayload;
+
+  const signatureBytes = Utilities.computeHmacSha256Signature(
+    signatureInput,
+    getSecretKey()
+  );
+  const encodedSignature = base64UrlEncodeArray(signatureBytes);
+
+  return signatureInput + "." + encodedSignature;
+}
+
+function verifyToken(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const signatureInput = parts[0] + "." + parts[1];
+    const signatureBytes = Utilities.computeHmacSha256Signature(
+      signatureInput,
+      getSecretKey()
+    );
+    const expectedSignature = base64UrlEncodeArray(signatureBytes);
+
+    if (parts[2] !== expectedSignature) return null;
+
+    const payloadBlob = Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[1]));
+    const payload = JSON.parse(payloadBlob.getDataAsString());
+
+    // Check expiration (if we set one, e.g., 24 hours)
+    if (payload.exp && Date.now() > payload.exp) return null;
+
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+function hashPassword(password) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, password);
+  return bytes.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, '0')).join('');
+}
+
+function checkStudentRegistrationForReset(id, bdate) {
+  try {
+    id = String(id).trim();
+    bdate = String(bdate).trim();
+
+    if (!id || !bdate) return { success: false, message: "ID and Birthdate are required." };
+
+    const ss = SpreadsheetApp.openById(MASTER_ID);
+    const credSheet = ss.getSheetByName("Credentials");
+    if (!credSheet) return { success: false, message: "Database Error." };
+
+    const credData = credSheet.getDataRange().getValues();
+    const headers = credData[0];
+    const emailIndex = headers.indexOf("Email");
+
+    for (let i = 1; i < credData.length; i++) {
+      if (String(credData[i][0]).trim() === id) {
+        let storedBdate = String(credData[i][1]).trim();
+        if (storedBdate === bdate) {
+          let email = emailIndex !== -1 ? credData[i][emailIndex] : null;
+          return { success: true, email: email, message: "Verified" };
+        } else {
+          return { success: false, message: "Incorrect Birthdate." };
+        }
+      }
+    }
+
+    return { success: false, message: "Student ID not found." };
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+}
+
+function registerEmailAndSendOTP(id, bdate, email) {
+  try {
+    id = String(id).trim();
+    bdate = String(bdate).trim();
+    email = String(email).trim();
+
+    if (!id || !bdate || !email) return { success: false, message: "All fields are required." };
+
+    const verifyRes = checkStudentRegistrationForReset(id, bdate);
+    if (!verifyRes.success) return verifyRes;
+
+    const ss = SpreadsheetApp.openById(MASTER_ID);
+    const credSheet = ss.getSheetByName("Credentials");
+    const credData = credSheet.getDataRange().getValues();
+    const headers = credData[0];
+    const emailIndex = headers.indexOf("Email");
+
+    if (emailIndex === -1) return { success: false, message: "Email column missing." };
+
+    let rowIndex = -1;
+    for (let i = 1; i < credData.length; i++) {
+      if (String(credData[i][0]).trim() === id) {
+        rowIndex = i + 1;
+        break;
+      }
+    }
+
+    if (rowIndex === -1) return { success: false, message: "Student ID not found." };
+
+    // Save email
+    credSheet.getRange(rowIndex, emailIndex + 1).setValue(email);
+
+    // Now trigger send OTP using existing function
+    return generateAndSendOTP(id);
+
+  } catch(err) {
     return { success: false, message: err.message };
   }
 }
